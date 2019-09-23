@@ -4,7 +4,7 @@ import caffe.proto.caffe_pb2 as caffe_pb2
 
 def parse_caffemodel(caffemodel):
     model = caffe_pb2.NetParameter()
-    print 'Loading caffemodel: ', caffemodel
+    print('Loading caffemodel: ', caffemodel)
     with open(caffemodel, 'rb') as fp:
         model.ParseFromString(fp.read())
 
@@ -30,7 +30,7 @@ def parse_prototxt(protofile):
                 key, value = line.split(':')
                 key = key.strip()
                 value = value.strip().strip('"')
-                if block.has_key(key):
+                if key in block:
                     if type(block[key]) == list:
                         block[key].append(value)
                     else:
@@ -59,7 +59,7 @@ def parse_prototxt(protofile):
             key, value = line.split(':')
             key = key.strip()
             value = value.strip().strip('"')
-            if props.has_key(key):
+            if key in props:
                if type(props[key]) == list:
                    props[key].append(value)
                else:
@@ -155,9 +155,9 @@ def save_prototxt(net_info, protofile, region=True):
         
     props = net_info['props']
     print >> fp, 'name: \"%s\"' % props['name']
-    if props.has_key('input'):
+    if 'input' in props:
         print >> fp, 'input: \"%s\"' % props['input']
-    if props.has_key('input_dim'):
+    if 'input_dim' in props:
         print >> fp, 'input_dim: %s' % props['input_dim'][0]
         print >> fp, 'input_dim: %s' % props['input_dim'][1]
         print >> fp, 'input_dim: %s' % props['input_dim'][2]
@@ -181,7 +181,7 @@ def parse_solver(solverfile):
         items = line.split(':')
         key = items[0].strip()
         value = items[1].strip().strip('"')
-        if not solver.has_key(key):
+        if not key in solver:
             solver[key] = value
         elif not type(solver[key]) == list:
             solver[key] = [solver[key], value]

@@ -12,7 +12,9 @@ from collections import OrderedDict
 from prototxt import *
 import caffe
 import caffe.proto.caffe_pb2 as caffe_pb2
-from torch.legacy.nn import SpatialCrossMapLRN as SpatialCrossMapLRNOld
+from LRN import CrossMapLRN2d, _cross_map_lrn2d
+# from torch.nn.modules import CrossMapLRN2d
+# from torch.legacy.nn import SpatialCrossMapLRN as SpatialCrossMapLRNOld # Deprecated in newer torch
 from itertools import product as product
 from detection import Detection, MultiBoxLoss
 
@@ -28,7 +30,7 @@ class CaffeData(nn.Module):
         props['name'] = 'temp network'
         net_info['props'] = props
         print('CaffeData init phase = %s' % (layer['include']['phase']))
-        if layer.has_key('include'):
+        if 'include' in layer:
             layer.pop('include')
         net_info['layers'] = [layer]
 
@@ -38,7 +40,7 @@ class CaffeData(nn.Module):
         weightfile = '.temp_data%f.caffemodel' % rand_val
         open(weightfile, 'w').close()
         caffe.set_mode_cpu()
-        if layer.has_key('include') and layer['include'] == 'TRAIN':
+        if 'include' in layer and layer['include'] == 'TRAIN':
             self.net = caffe.Net(protofile, weightfile, caffe.TRAIN)
         else:
             self.net = caffe.Net(protofile, weightfile, caffe.TEST)
@@ -48,7 +50,7 @@ class CaffeData(nn.Module):
         return 'CaffeData()'
     def forward(self):
         self.net.forward()
-        data = self.net.blobs['data'].data
+        data = self.net.blobs[self.in_bname].data
         label = self.net.blobs['label'].data
         data = torch.from_numpy(data)
         label = torch.from_numpy(label)
@@ -117,14 +119,16 @@ class Scale(nn.Module):
         return x
 
 class Crop(nn.Module):
-    def __init__(self, axis, offset):
+    def __init__(self, axis, offset, ref):
         super(Crop, self).__init__()
         self.axis = axis
         self.offset = offset
+        self.ref = ref
     def __repr__(self):
         return 'Crop(axis=%d, offset=%d)' % (self.axis, self.offset)
 
-    def forward(self, x, ref):
+    def forward(self, x):
+        ref = self.ref
         for axis in range(self.axis, x.dim()):
             ref_size = ref.size(axis)
             indices = torch.arange(self.offset, self.offset + ref_size).long()
@@ -243,6 +247,7 @@ class Flatten(nn.Module):
 
 # function interface, internal, do not use this one!!!
 class LRNFunc(Function):
+    '''https://github.com/pytorch/pytorch/pull/4667'''
     def __init__(self, size, alpha=1e-4, beta=0.75, k=1):
         super(LRNFunc, self).__init__()
         self.size = size
@@ -251,14 +256,15 @@ class LRNFunc(Function):
         self.k = k
 
     def forward(self, input):
-        self.save_for_backward(input)
-        self.lrn = SpatialCrossMapLRNOld(self.size, self.alpha, self.beta, self.k)
+        # self.save_for_backward(input)
+        self.lrn = CrossMapLRN2d(self.size, self.alpha, self.beta, self.k)
+        # self.lrn = SpatialCrossMapLRNOld(self.size, self.alpha, self.beta, self.k)
         self.lrn.type(input.type())
         return self.lrn.forward(input)
 
-    def backward(self, grad_output):
-        input, = self.saved_tensors
-        return self.lrn.backward(input, grad_output)
+    # def backward(self, grad_output):
+    #     # input, = self.saved_tensors
+    #     return self.lrn.backward(grad_output)
 
 
 # use this one instead
@@ -269,12 +275,13 @@ class LRN(nn.Module):
         self.alpha = alpha
         self.beta = beta
         self.k = k
+        self.lrn = _cross_map_lrn2d.apply
 
     def __repr__(self):
         return 'LRN(size=%d, alpha=%f, beta=%f, k=%d)' % (self.size, self.alpha, self.beta, self.k)
 
     def forward(self, input):
-        return LRNFunc(self.size, self.alpha, self.beta, self.k)(input)
+        return self.lrn(input, self.size, self.alpha, self.beta, self.k)
 
 class Reshape(nn.Module):
     def __init__(self, dims):
@@ -383,7 +390,7 @@ class CaffeNet(nn.Module):
             self.add_module(name, model)
 
         self.has_mean = False
-        if self.net_info['props'].has_key('mean_file'):
+        if 'mean_file' in self.net_info['props']:
             self.has_mean = True
             self.mean_file = self.net_info['props']['mean_file']
 
@@ -450,7 +457,7 @@ class CaffeNet(nn.Module):
         if len(inputs) >= 2:
             data = inputs[0]
             label = inputs[1]
-            self.blobs['data'] = data
+            self.blobs[self.in_bname] = data
             self.blobs['label'] = label
             if self.has_mean:
                 nB = data.data.size(0)
@@ -460,7 +467,7 @@ class CaffeNet(nn.Module):
                 data = data - Variable(self.mean_img.view(1, nC, nH, nW).expand(nB, nC, nH, nW))
         elif len(inputs) == 1:
             data = inputs[0]
-            self.blobs['data'] = data
+            self.blobs[self.in_bname] = data
             if self.has_mean:
                 nB = data.data.size(0)
                 nC = data.data.size(1)
@@ -476,7 +483,7 @@ class CaffeNet(nn.Module):
         while i < layer_num:
             layer = layers[i]
             lname = layer['name']
-            if layer.has_key('include') and layer['include'].has_key('phase'):
+            if 'include' in layer and 'phase' in layer['include']:
                 phase = layer['include']['phase']
                 lname = lname + '.' + phase
                 if phase != self.phase:
@@ -562,7 +569,7 @@ class CaffeNet(nn.Module):
             mean_blob = caffe_pb2.BlobProto()
             mean_blob.ParseFromString(open(self.mean_file, 'rb').read())
 
-            if self.net_info['props'].has_key('input_shape'):
+            if 'input_shape' in self.net_info['props']:
                 channels = int(self.net_info['props']['input_shape']['dim'][1])
                 height = int(self.net_info['props']['input_shape']['dim'][2])
                 width = int(self.net_info['props']['input_shape']['dim'][3])
@@ -595,18 +602,18 @@ class CaffeNet(nn.Module):
         while i < layer_num:
             layer = layers[i]
             lname = layer['name']
-            if layer.has_key('include') and layer['include'].has_key('phase'):
+            if 'include' in layer and 'phase' in layer['include']:
                 phase = layer['include']['phase']
                 lname = lname + '.' + phase
             ltype = layer['type']
-            if not lmap.has_key(lname):
+            if not lname in lmap:
                 i = i + 1
                 continue
             if ltype in ['Convolution', 'Deconvolution']:
                 print('load weights %s' % lname)
                 convolution_param = layer['convolution_param']
                 bias = True
-                if convolution_param.has_key('bias_term') and convolution_param['bias_term'] == 'false':
+                if 'bias_term' in convolution_param and convolution_param['bias_term'] == 'false':
                     bias = False
                 #weight_blob = lmap[lname].blobs[0]
                 #print('caffe weight shape', weight_blob.num, weight_blob.channels, weight_blob.height, weight_blob.width)
@@ -634,7 +641,10 @@ class CaffeNet(nn.Module):
             elif ltype == 'InnerProduct':
                 print('load weights %s' % lname)
                 if type(self.models[lname]) == nn.Sequential:
-                    self.models[lname][1].weight.data.copy_(torch.from_numpy(np.array(lmap[lname].blobs[0].data)))
+                    caffe_weight = np.array(lmap[lname].blobs[0].data)
+                    caffe_weight = torch.from_numpy(caffe_weight).view_as(self.models[lname][1].weight)
+                    self.models[lname][1].weight.data.copy_(caffe_weight)
+                    #self.models[lname][1].weight.data.copy_(torch.from_numpy(np.array(lmap[lname].blobs[0].data)))
                     if len(lmap[lname].blobs) > 1:
                         self.models[lname][1].bias.data.copy_(torch.from_numpy(np.array(lmap[lname].blobs[1].data)))
                 else:
@@ -655,35 +665,48 @@ class CaffeNet(nn.Module):
 
         layers = net_info['layers']
         props = net_info['props']
+        self.in_bname = props['input']  # normally 'data' sometimes strange names
         layer_num = len(layers)
 
-        blob_channels['data'] = 3
+        blob_channels[self.in_bname] = 3
         if input_channels != None:
-            blob_channels['data'] = input_channels
-        blob_height['data'] = 1
+            blob_channels[self.in_bname] = input_channels
+        blob_height[self.in_bname] = 1
         if input_height != None:
-            blob_height['data'] = input_height
-        blob_width['data'] = 1
+            blob_height[self.in_bname] = input_height
+        blob_width[self.in_bname] = 1
         if input_width != None:
-            blob_width['data'] = input_width
-        if props.has_key('input_shape'):
-            blob_channels['data'] = int(props['input_shape']['dim'][1])
-            blob_height['data'] = int(props['input_shape']['dim'][2])
-            blob_width['data'] = int(props['input_shape']['dim'][3])
-    
-            self.width = int(props['input_shape']['dim'][3])
-            self.height = int(props['input_shape']['dim'][2])
-        elif props.has_key('input_dim'):
-            blob_channels['data'] = int(props['input_dim'][1])
-            blob_height['data'] = int(props['input_dim'][2])
-            blob_width['data'] = int(props['input_dim'][3])
-    
-            self.width = int(props['input_dim'][3])
-            self.height = int(props['input_dim'][2])
+            blob_width[self.in_bname] = input_width
+        if 'input_shape' in props:
+            blob_channels[self.in_bname] = int(props['input_shape']['dim'][1])
+            if len(props['input_shape']['dim']) == 4:
+                blob_height[self.in_bname] = int(props['input_shape']['dim'][2])
+                blob_width[self.in_bname] = int(props['input_shape']['dim'][3])
+
+                self.width = int(props['input_shape']['dim'][3])
+                self.height = int(props['input_shape']['dim'][2])
+            else:
+                blob_height[self.in_bname] = 1
+                blob_width[self.in_bname] = 1
+                self.width = 1
+                self.height = 1
+        elif 'input_dim' in props:
+            blob_channels[self.in_bname] = int(props['input_dim'][1])
+            if len(props['input_shape']['dim']) == 4:
+                blob_height[self.in_bname] = int(props['input_dim'][2])
+                blob_width[self.in_bname] = int(props['input_dim'][3])
+
+                self.width = int(props['input_dim'][3])
+                self.height = int(props['input_dim'][2])
+            else:
+                blob_height[self.in_bname] = 1
+                blob_width[self.in_bname] = 1
+                self.width = 1
+                self.height = 1
 
         if input_width != None and input_height != None:
-            blob_width['data'] = input_width
-            blob_height['data'] = input_height
+            blob_width[self.in_bname] = input_width
+            blob_height[self.in_bname] = input_height
             self.width = input_width
             self.height = input_height
 
@@ -691,7 +714,7 @@ class CaffeNet(nn.Module):
         while i < layer_num:
             layer = layers[i]
             lname = layer['name']
-            if layer.has_key('include') and layer['include'].has_key('phase'):
+            if 'include' in layer and 'phase' in layer['include']:
                 phase = layer['include']['phase']
                 lname = lname + '.' + phase
             ltype = layer['type']
@@ -714,14 +737,14 @@ class CaffeNet(nn.Module):
                 channels = blob_channels[bname]
                 out_filters = int(convolution_param['num_output'])
                 kernel_size = int(convolution_param['kernel_size'])
-                stride = int(convolution_param['stride']) if convolution_param.has_key('stride') else 1
-                pad = int(convolution_param['pad']) if convolution_param.has_key('pad') else 0
-                group = int(convolution_param['group']) if convolution_param.has_key('group') else 1
+                stride = int(convolution_param['stride']) if 'stride' in convolution_param else 1
+                pad = int(convolution_param['pad']) if 'pad' in convolution_param else 0
+                group = int(convolution_param['group']) if 'group' in convolution_param else 1
                 dilation = 1
-                if convolution_param.has_key('dilation'):
+                if 'dilation' in convolution_param:
                     dilation = int(convolution_param['dilation'])
                 bias = True
-                if convolution_param.has_key('bias_term') and convolution_param['bias_term'] == 'false':
+                if 'bias_term' in convolution_param and convolution_param['bias_term'] == 'false':
                     bias = False
                 models[lname] = nn.Conv2d(channels, out_filters, kernel_size=kernel_size, stride=stride, padding=pad, dilation=dilation, groups=group, bias=bias)
                 blob_channels[tname] = out_filters
@@ -730,7 +753,7 @@ class CaffeNet(nn.Module):
                 i = i + 1
             elif ltype == 'BatchNorm':
                 momentum = 0.9
-                if layer.has_key('batch_norm_param') and layer['batch_norm_param'].has_key('moving_average_fraction'):
+                if 'batch_norm_param' in layer and 'moving_average_fraction' in layer['batch_norm_param']:
                     momentum = float(layer['batch_norm_param']['moving_average_fraction'])
                 channels = blob_channels[bname]
                 models[lname] = nn.BatchNorm2d(channels, momentum=momentum, affine=False)
@@ -747,7 +770,7 @@ class CaffeNet(nn.Module):
                 i = i + 1
             elif ltype == 'ReLU':
                 inplace = (bname == tname)
-                if layer.has_key('relu_param') and layer['relu_param'].has_key('negative_slope'):
+                if 'relu_param' in layer and 'negative_slope' in layer['relu_param']:
                     negative_slope = float(layer['relu_param']['negative_slope'])
                     models[lname] = nn.LeakyReLU(negative_slope=negative_slope, inplace=inplace)
                 else:
@@ -760,7 +783,7 @@ class CaffeNet(nn.Module):
                 kernel_size = int(layer['pooling_param']['kernel_size'])
                 stride = int(layer['pooling_param']['stride'])
                 padding = 0
-                if layer['pooling_param'].has_key('pad'):
+                if 'pad' in layer['pooling_param']:
                     padding = int(layer['pooling_param']['pad'])
                 pool_type = layer['pooling_param']['pool']
                 if pool_type == 'MAX':
@@ -774,7 +797,7 @@ class CaffeNet(nn.Module):
                 i = i + 1
             elif ltype == 'Eltwise':
                 operation = 'SUM'
-                if layer.has_key('eltwise_param') and layer['eltwise_param'].has_key('operation'):
+                if 'eltwise_param' in layer and 'operation' in layer['eltwise_param']:
                     operation = layer['eltwise_param']['operation']
                 bname0 = bname[0]
                 bname1 = bname[1]
@@ -859,7 +882,7 @@ class CaffeNet(nn.Module):
                 i = i + 1
             elif ltype == 'Concat':
                 axis = 1
-                if layer.has_key('concat_param') and layer['concat_param'].has_key('axis'):
+                if 'concat_param' in layer and 'axis' in layer['concat_param']:
                     axis = int(layer['concat_param']['axis'])
                 models[lname] = Concat(axis)  
                 if axis == 1:
@@ -878,16 +901,16 @@ class CaffeNet(nn.Module):
             elif ltype == 'PriorBox':
                 min_size = float(layer['prior_box_param']['min_size'])
                 max_size = -1
-                if layer['prior_box_param'].has_key('max_size'):
+                if 'max_size' in layer['prior_box_param']:
                     max_size = float(layer['prior_box_param']['max_size'])
                 aspects = []
-                if layer['prior_box_param'].has_key('aspect_ratio'):
+                if 'aspect_ratio' in layer['prior_box_param']:
                     print(layer['prior_box_param']['aspect_ratio'])
                     aspects = layer['prior_box_param']['aspect_ratio']
                     aspects = [float(aspect) for aspect in aspects]
                 clip = (layer['prior_box_param']['clip'] == 'true')
                 flip = False
-                if layer['prior_box_param'].has_key('flip'):
+                if 'flip' in layer['prior_box_param']:
                     flip = (layer['prior_box_param']['flip'] == 'true')
                 step = int(layer['prior_box_param']['step'])
                 offset = float(layer['prior_box_param']['offset'])
@@ -936,33 +959,53 @@ class CaffeNet(nn.Module):
                 #models[lname] = nn.Upsample(scale_factor=2, mode='bilinear')
                 in_channels = blob_channels[bname]
                 out_channels = int(layer['convolution_param']['num_output'])
-                group = int(layer['convolution_param']['group'])
-                kernel_w = int(layer['convolution_param']['kernel_w'])
-                kernel_h = int(layer['convolution_param']['kernel_h'])
-                stride_w = int(layer['convolution_param']['stride_w'])
-                stride_h = int(layer['convolution_param']['stride_h'])
-                pad_w = int(layer['convolution_param']['pad_w'])
-                pad_h = int(layer['convolution_param']['pad_h'])
+                group = int(layer['convolution_param']['group']) if 'group' in layer['convolution_param'] else 1
+                if 'kernel_size' in layer['convolution_param']:
+                    kernel_w = int(layer['convolution_param']['kernel_size'])
+                    kernel_h = int(layer['convolution_param']['kernel_size'])
+                else:
+                    kernel_w = int(layer['convolution_param']['kernel_w'])
+                    kernel_h = int(layer['convolution_param']['kernel_h'])
+                if 'stride' in layer['convolution_param']:
+                    stride_w = int(layer['convolution_param']['stride'])
+                    stride_h = int(layer['convolution_param']['stride'])
+                else:
+                    stride_w = int(layer['convolution_param']['stride_w'])
+                    stride_h = int(layer['convolution_param']['stride_h'])
+                if 'pad' in layer['convolution_param']:
+                    pad_w = int(layer['convolution_param']['pad'])
+                    pad_h = int(layer['convolution_param']['pad'])
+                else:
+                    pad_w = int(layer['convolution_param']['pad_w'])
+                    pad_h = int(layer['convolution_param']['pad_h'])
                 kernel_size = (kernel_h, kernel_w)
                 stride = (stride_h, stride_w)
                 padding = (pad_h, pad_w)
-                bias_term = layer['convolution_param']['bias_term'] != 'false'
-                models[lname] = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=kernel_size, stride = stride, padding=padding, groups = group, bias=bias_term)
+                if 'bias_term' in layer['convolution_param']:
+                    bias_term = layer['convolution_param']['bias_term'] != 'false'
+                else:
+                    bias_term = True
+                models[lname] = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding, groups=group, bias=bias_term)
                 blob_channels[tname] = out_channels
-                blob_width[tname] = 2 * blob_width[bname]
-                blob_height[tname] = 2 * blob_height[bname]
+                blob_width[tname] = (blob_width[bname] - 1) * stride_w + kernel_w - 2 * pad_w
+                blob_height[tname] = (blob_height[bname] - 1) * stride_h + kernel_h - 2 * pad_h
                 i = i + 1
             elif ltype == 'Reshape':
                 reshape_dims = layer['reshape_param']['shape']['dim']
                 reshape_dims = [int(item) for item in reshape_dims]
                 models[lname] = Reshape(reshape_dims)
-                blob_channels[tname] = 1
-                blob_width[tname] = 1
-                blob_height[tname] = 1
+                if len(reshape_dims) == 4:
+                    blob_channels[tname] = reshape_dims[1] # 1
+                    blob_width[tname] = reshape_dims[2] # 1
+                    blob_height[tname] = reshape_dims[3] # 1
+                else:
+                    blob_channels[tname] = 1
+                    blob_width[tname] = 1
+                    blob_height[tname] = 1
                 i = i + 1
             elif ltype == 'Softmax':
                 axis = 1
-                if layer.has_key('softmax_param') and layer['softmax_param'].has_key('axis'):
+                if 'softmax_param' in layer and 'axis' in layer['softmax_param']:
                     axis = int(layer['softmax_param']['axis'])
                 models[lname] = Softmax(axis)
                 blob_channels[tname] = blob_channels[bname]

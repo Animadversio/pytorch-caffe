@@ -838,7 +838,7 @@ class CaffeNet(nn.Module):
                 local_size = int(layer['lrn_param']['local_size'])
                 alpha = float(layer['lrn_param']['alpha'])
                 beta = float(layer['lrn_param']['beta'])
-                models[lname] = LRN(local_size, alpha, beta)
+                models[lname] = nn.LocalResponseNorm(local_size, alpha, beta)  # use the pytorch 1.3.1 new module LRN
                 blob_channels[tname] = blob_channels[bname]
                 blob_width[tname] = blob_width[bname]
                 blob_height[tname] = blob_height[bname]
